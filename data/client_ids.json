@@ -1,0 +1,37 @@
+{
+  "allocations": {
+    "strategy:ASSET": {
+      "allocated_at": 1763633122.3695145,
+      "id": 9004,
+      "name": "ASSET",
+      "role": "strategy"
+    },
+    "strategy:IBM_Fourier": {
+      "allocated_at": 1763624409.306782,
+      "id": 9000,
+      "name": "IBM_Fourier",
+      "role": "strategy"
+    },
+    "strategy:IYW_GLD_org": {
+      "allocated_at": 1763624409.3222942,
+      "id": 9001,
+      "name": "IYW_GLD_org",
+      "role": "strategy"
+    },
+    "strategy:IYW_GLD_volguard": {
+      "allocated_at": 1763624409.3499124,
+      "id": 9002,
+      "name": "IYW_GLD_volguard",
+      "role": "strategy"
+    },
+    "strategy:SPY_ODTE": {
+      "allocated_at": 1763632747.238945,
+      "id": 9003,
+      "name": "SPY_ODTE",
+      "role": "strategy"
+    }
+  },
+  "created_at": 1763624409.306782,
+  "modified_at": 1763633122.3695145,
+  "version": 1
+}

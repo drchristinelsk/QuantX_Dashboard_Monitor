@@ -1,0 +1,18 @@
+# Core app
+streamlit>=1.32.0
+
+# Data handling
+pandas>=2.1.0
+numpy>=1.24.0
+
+# Visualization
+altair>=5.0.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Optional logo image support
+pillow>=9.0.0
+
+# Client ID manager (file locking for client_ids.json)
+filelock>=3.13.0
