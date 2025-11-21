@@ -1,48 +1,49 @@
 # utils/performance_metrics.py
 """
-Performance Metrics Calculator for Trading Strategies
+Professional performance metrics calculator for trading strategies.
 
-PATCHED VERSION 2.0 - Critical Fixes Applied:
-1. Fixed compute_open_positions to handle shorts correctly
-2. Fixed CAGR calculation for negative equity
-3. Vectorized position reconstruction (10-100x faster)
-4. Implemented Sortino ratio
-5. Fixed profit factor infinity handling
-6. Robust drawdown calculations
-7. Better error handling throughout
-
-Author: Quant X Team
-Version: 2.0 (Production Ready)
+Features:
+- Comprehensive risk-adjusted metrics (Sharpe, Sortino, CAGR)
+- ENHANCED: Intraday Sharpe/Sortino when daily data insufficient
+- Robust drawdown calculation with timestamps
+- Multi-directional position tracking (LONG/SHORT)
+- Open P/L calculation with live price lookup
+- Handles edge cases and missing data gracefully
 """
 
 import numpy as np
 import pandas as pd
 from typing import Callable, Optional, Dict, Tuple, List, Any
-import logging
+import warnings
 
-logger = logging.getLogger(__name__)
 
-# Constants
+# ============================================================================
+# CONSTANTS
+# ============================================================================
 TRADING_DAYS_PER_YEAR = 252
-RISK_FREE_RATE = 0.02  # 2% annualized (configurable)
+TRADING_HOURS_PER_DAY = 6.5  # US market: 9:30 AM - 4:00 PM ET
+TRADING_MINUTES_PER_YEAR = TRADING_DAYS_PER_YEAR * TRADING_HOURS_PER_DAY * 60
+
+MIN_DAILY_RETURNS_FOR_SHARPE = 10  # Minimum daily returns needed
+MIN_RETURNS_FOR_SHARPE = 5  # Absolute minimum returns needed
 
 
-# ----------------------------
-# Robust Drawdown Calculation
-# ----------------------------
+# ============================================================================
+# ROBUST DRAWDOWN CALCULATION
+# ============================================================================
 def max_drawdown_stats(
     pnl: pd.Series,
     timestamps: pd.Series | None = None,
     start_equity: float = 0.0
-) -> Tuple[float, float, Any, Any, pd.Timedelta]:
+):
     """
-    Calculate maximum drawdown statistics.
+    Calculate maximum drawdown with detailed statistics.
     
     Args:
-        pnl: Series of P&L changes (NOT cumulative)
-        timestamps: Optional timestamp series
+        pnl: Series of P&L values
+        timestamps: Optional timestamp series for duration calculation
         start_equity: Starting equity value
-        
+    
     Returns:
         Tuple of (mdd_abs, mdd_pct, dd_start, dd_end, dd_duration)
     """
@@ -60,19 +61,8 @@ def max_drawdown_stats(
 
     # Calculate percentage drawdown safely
     peak_np = peak.to_numpy()
-    equity_np = equity.to_numpy()
-    
     with np.errstate(divide="ignore", invalid="ignore"):
-        # Handle negative peaks specially
-        pct_vals = np.where(
-            peak_np == 0,
-            np.nan,
-            np.where(
-                peak_np > 0,
-                equity_np / peak_np - 1.0,  # Normal case
-                np.nan  # Undefined for negative peak
-            )
-        )
+        pct_vals = np.where(peak_np == 0, np.nan, equity.to_numpy() / peak_np - 1.0)
 
     pct_series = pd.Series(pct_vals, index=equity.index)
 
@@ -84,7 +74,7 @@ def max_drawdown_stats(
     if dd_abs.isna().all():
         return 0.0, 0.0, None, None, pd.Timedelta(0)
 
-    # Find drawdown period
+    # Find drawdown start and end
     dd_end_idx = dd_abs.idxmax()
     dd_start_idx = equity.loc[:dd_end_idx].idxmax()
 
@@ -103,17 +93,17 @@ def max_drawdown_stats(
     try:
         if isinstance(dd_start, pd.Timestamp) and isinstance(dd_end, pd.Timestamp):
             dd_duration = dd_end - dd_start
-    except Exception as e:
-        logger.debug(f"Error calculating drawdown duration: {e}")
+    except Exception:
+        pass
 
     return mdd_abs, mdd_pct, dd_start, dd_end, dd_duration
 
 
-# ---------------------------------------------------------
-# Open-position reconstruction & mark-to-market (Open P/L)
-# ---------------------------------------------------------
+# ============================================================================
+# HELPER FUNCTIONS
+# ============================================================================
 def _as_float(x: Any) -> float:
-    """Safe conversion to float."""
+    """Safely convert to float."""
     try:
         return float(x)
     except Exception:
@@ -121,33 +111,28 @@ def _as_float(x: Any) -> float:
 
 
 def _as_int(x: Any) -> int:
-    """Safe conversion to int."""
+    """Safely convert to int."""
     try:
         return int(x)
     except Exception:
         return 0
 
 
+# ============================================================================
+# ENHANCED POSITION TRACKING (LONG/SHORT SUPPORT)
+# ============================================================================
 def compute_open_positions(trades: pd.DataFrame) -> Dict[str, Tuple[int, float]]:
     """
     Reconstruct current open positions from trade history.
-    
-    FIXED: Now properly handles:
-    - Long positions (BUY adds, SELL reduces)
-    - Short positions (SELL to open, BUY to cover)
-    - Average price calculation (cost basis)
-    - Position sign (positive = long, negative = short)
+    Supports LONG and SHORT positions.
     
     Args:
         trades: DataFrame with columns: symbol, action, quantity, price, status, timestamp
-        
+    
     Returns:
-        Dict mapping symbol -> (net_quantity, avg_price)
-        net_quantity > 0 = long position
-        net_quantity < 0 = short position
-        avg_price = average cost basis
-        
-    Note: This is a VECTORIZED implementation for performance.
+        Dict mapping symbol to (signed_qty, avg_price)
+        - signed_qty > 0 = LONG position
+        - signed_qty < 0 = SHORT position
     """
     if trades is None or trades.empty:
         return {}
@@ -155,8 +140,7 @@ def compute_open_positions(trades: pd.DataFrame) -> Dict[str, Tuple[int, float]]
     df = trades.copy()
 
     # Ensure required columns exist
-    required_cols = ["symbol", "action", "quantity", "price", "status", "timestamp"]
-    for col in required_cols:
+    for col in ("symbol", "action", "quantity", "price", "status", "timestamp"):
         if col not in df.columns:
             df[col] = np.nan
 
@@ -167,83 +151,93 @@ def compute_open_positions(trades: pd.DataFrame) -> Dict[str, Tuple[int, float]]
     if df.empty:
         return {}
 
-    # Sort by timestamp to get chronological order
     df = df.sort_values("timestamp")
 
-    # Convert to numeric
-    df["quantity"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0).astype(int)
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
+    # Track signed positions (positive = long, negative = short)
+    position_map: Dict[str, int] = {}  # symbol -> signed_qty
+    avg_map: Dict[str, float] = {}     # symbol -> avg_entry_price
 
-    # Remove invalid rows
-    df = df[(df["quantity"] > 0) & (df["price"].notna()) & (df["symbol"].notna())]
-    
-    if df.empty:
-        return {}
+    for _, row in df.iterrows():
+        sym = str(row.get("symbol"))
+        act = str(row.get("action", "")).upper()
+        qty = _as_int(row.get("quantity"))
+        px = _as_float(row.get("price"))
 
-    # VECTORIZED APPROACH: Create signed quantities
-    # BUY = positive, SELL = negative
-    df["signed_qty"] = np.where(
-        df["action"].str.upper() == "BUY",
-        df["quantity"],
-        -df["quantity"]
-    )
-    
-    df["cost"] = df["signed_qty"] * df["price"]
-
-    # Group by symbol and calculate positions
-    positions = {}
-    
-    for symbol in df["symbol"].unique():
-        symbol_df = df[df["symbol"] == symbol].copy()
-        
-        # Calculate cumulative position and cost basis
-        symbol_df["cumulative_qty"] = symbol_df["signed_qty"].cumsum()
-        symbol_df["cumulative_cost"] = symbol_df["cost"].cumsum()
-        
-        final_qty = int(symbol_df["cumulative_qty"].iloc[-1])
-        
-        if final_qty == 0:
-            # Position is flat, skip
+        if not np.isfinite(px) or qty <= 0 or not sym:
             continue
-        
-        # Calculate average price based on current position
-        final_cost = float(symbol_df["cumulative_cost"].iloc[-1])
-        
-        # Average price = total cost / total quantity
-        # For shorts, this gives negative avg price which we'll handle
-        if final_qty != 0:
-            avg_price = abs(final_cost / final_qty)  # Use absolute for cost basis
-        else:
-            avg_price = 0.0
-        
-        positions[str(symbol)] = (final_qty, avg_price)
-    
-    return positions
+
+        current_pos = position_map.get(sym, 0)
+        current_avg = avg_map.get(sym, 0.0)
+
+        if act == "BUY":
+            # Buying: increases position (or reduces short)
+            new_pos = current_pos + qty
+            
+            if current_pos >= 0:
+                # Already long or flat -> add to long
+                if new_pos != 0:
+                    avg_map[sym] = (current_avg * current_pos + px * qty) / new_pos
+                else:
+                    avg_map[sym] = 0.0
+            else:
+                # Currently short -> covering
+                if new_pos >= 0:
+                    # Fully covered or flipped to long
+                    avg_map[sym] = px if new_pos > 0 else 0.0
+                else:
+                    # Still short, keep short avg
+                    pass
+                
+            position_map[sym] = new_pos
+
+        elif act == "SELL":
+            # Selling: decreases position (or increases short)
+            new_pos = current_pos - qty
+            
+            if current_pos <= 0:
+                # Already short or flat -> add to short
+                if new_pos != 0:
+                    avg_map[sym] = (abs(current_avg * current_pos) + px * qty) / abs(new_pos)
+                else:
+                    avg_map[sym] = 0.0
+            else:
+                # Currently long -> reducing
+                if new_pos <= 0:
+                    # Fully closed or flipped to short
+                    avg_map[sym] = px if new_pos < 0 else 0.0
+                else:
+                    # Still long, keep long avg
+                    pass
+                
+            position_map[sym] = new_pos
+
+    # Return only non-zero positions
+    return {
+        sym: (position_map[sym], avg_map[sym]) 
+        for sym in position_map 
+        if position_map[sym] != 0
+    }
 
 
 def compute_open_pl(
     trades: pd.DataFrame,
     price_lookup: Callable[[str], Optional[float]],
-) -> Tuple[float, List[Dict[str, Any]]]:
+) -> tuple[float, list[dict]]:
     """
-    Compute open P/L from reconstructed positions and current market prices.
-    
-    FIXED: Now correctly handles both long and short positions:
-    - Long: P/L = (current_price - avg_price) * qty
-    - Short: P/L = (avg_price - current_price) * abs(qty)
+    Calculate open P/L from current positions and live prices.
     
     Args:
         trades: Trade history DataFrame
-        price_lookup: Function to get current price for a symbol
-        
+        price_lookup: Function that returns current price for a symbol
+    
     Returns:
-        Tuple of (total_open_pl, list of position details)
+        Tuple of (total_open_pl, details_list)
     """
     open_pos = compute_open_positions(trades)
     total = 0.0
     rows = []
 
-    for sym, (qty, avg) in open_pos.items():
+    for sym, (signed_qty, avg) in open_pos.items():
         last = price_lookup(sym) if callable(price_lookup) else None
         
         if last is None or not np.isfinite(last):
@@ -251,21 +245,17 @@ def compute_open_pl(
             last_out = None
         else:
             last_out = float(last)
-            
-            # Calculate P/L based on position direction
-            if qty > 0:
-                # Long position: profit when price goes up
-                mtm = (last_out - float(avg)) * int(qty)
-            else:
-                # Short position: profit when price goes down
-                mtm = (float(avg) - last_out) * abs(int(qty))
+            # P/L = (current_price - avg_price) * signed_qty
+            # For LONG: positive qty, profit if price rises
+            # For SHORT: negative qty, profit if price falls
+            mtm = (last_out - float(avg)) * int(signed_qty)
 
         total += mtm
 
         rows.append({
             "symbol": sym,
-            "qty": int(qty),
-            "direction": "LONG" if qty > 0 else "SHORT",
+            "qty": int(signed_qty),
+            "direction": "LONG" if signed_qty > 0 else "SHORT",
             "avg": float(avg),
             "last": last_out,
             "open_pl": float(mtm),
@@ -274,81 +264,121 @@ def compute_open_pl(
     return float(total), rows
 
 
-# -------------------------------
-# Sortino Ratio Implementation
-# -------------------------------
-def calculate_sortino(
-    returns: pd.Series,
-    risk_free_rate: float = RISK_FREE_RATE
-) -> float:
+# ============================================================================
+# ENHANCED SHARPE/SORTINO WITH INTRADAY SUPPORT
+# ============================================================================
+def calculate_sharpe_sortino(
+    equity_series: pd.Series,
+    freq: str = "daily"
+) -> tuple[float, float, str]:
     """
-    Calculate Sortino ratio using downside deviation.
-    
-    Sortino ratio = (Mean return - Risk free rate) / Downside deviation
-    
-    Better than Sharpe because it only penalizes downside volatility,
-    not upside volatility.
+    Calculate Sharpe and Sortino ratios with automatic frequency detection.
     
     Args:
-        returns: Series of daily returns
-        risk_free_rate: Annualized risk-free rate (default 2%)
-        
+        equity_series: Time-indexed equity curve
+        freq: "daily" (default) or "intraday"
+    
     Returns:
-        Annualized Sortino ratio
+        (sharpe, sortino, actual_freq_used)
     """
-    if len(returns) < 2:
-        return 0.0
+    if equity_series is None or len(equity_series) < MIN_RETURNS_FOR_SHARPE:
+        return 0.0, 0.0, "insufficient_data"
     
-    # Daily risk-free rate
-    daily_rf = risk_free_rate / TRADING_DAYS_PER_YEAR
-    excess_returns = returns - daily_rf
+    # Try daily first
+    daily_equity = equity_series.resample("1D").last().dropna()
+    daily_returns = daily_equity.pct_change().dropna()
     
-    # Only consider downside returns (negative excess returns)
-    downside_returns = excess_returns[excess_returns < 0]
+    if len(daily_returns) >= MIN_DAILY_RETURNS_FOR_SHARPE:
+        # Sufficient daily returns
+        mean_return = daily_returns.mean()
+        std_return = daily_returns.std()
+        
+        # Sharpe (daily)
+        if std_return > 1e-6:
+            sharpe = float(mean_return / std_return * np.sqrt(TRADING_DAYS_PER_YEAR))
+        else:
+            sharpe = 0.0
+        
+        # Sortino (daily)
+        downside_returns = daily_returns[daily_returns < 0]
+        if len(downside_returns) > 1:
+            downside_std = downside_returns.std()
+            if downside_std > 1e-6:
+                sortino = float(mean_return / downside_std * np.sqrt(TRADING_DAYS_PER_YEAR))
+            else:
+                sortino = 999.99 if mean_return > 0 else 0.0
+        else:
+            sortino = 999.99 if mean_return > 0 else 0.0
+        
+        return sharpe, sortino, "daily"
     
-    if len(downside_returns) == 0:
-        # No downside = infinite Sortino (cap at 9999)
-        return 9999.0 if excess_returns.mean() > 0 else 0.0
-    
-    downside_std = downside_returns.std()
-    
-    if downside_std == 0 or not np.isfinite(downside_std):
-        return 9999.0 if excess_returns.mean() > 0 else 0.0
-    
-    # Annualize
-    sortino = float(excess_returns.mean() / downside_std * np.sqrt(TRADING_DAYS_PER_YEAR))
-    
-    # Cap at reasonable values for display
-    return min(max(sortino, -9999.0), 9999.0)
+    else:
+        # Fall back to intraday (per-trade returns)
+        trade_returns = equity_series.pct_change().dropna()
+        
+        if len(trade_returns) < MIN_RETURNS_FOR_SHARPE:
+            return 0.0, 0.0, "insufficient_data"
+        
+        # Estimate trades per year (assume intraday trading)
+        if len(equity_series) > 1:
+            time_span = (equity_series.index[-1] - equity_series.index[0]).total_seconds() / 60  # minutes
+            trades_per_minute = len(trade_returns) / max(time_span, 1)
+            trades_per_year = trades_per_minute * TRADING_MINUTES_PER_YEAR
+            annualization_factor = np.sqrt(max(trades_per_year, 1))
+        else:
+            annualization_factor = np.sqrt(TRADING_DAYS_PER_YEAR)
+        
+        mean_return = trade_returns.mean()
+        std_return = trade_returns.std()
+        
+        # Sharpe (intraday, annualized)
+        if std_return > 1e-6:
+            sharpe = float(mean_return / std_return * annualization_factor)
+        else:
+            sharpe = 0.0
+        
+        # Sortino (intraday, annualized)
+        downside_returns = trade_returns[trade_returns < 0]
+        if len(downside_returns) > 1:
+            downside_std = downside_returns.std()
+            if downside_std > 1e-6:
+                sortino = float(mean_return / downside_std * annualization_factor)
+            else:
+                sortino = 999.99 if mean_return > 0 else 0.0
+        else:
+            sortino = 999.99 if mean_return > 0 else 0.0
+        
+        return sharpe, sortino, "intraday"
 
 
-# -------------------------------
+# ============================================================================
 # PROFESSIONAL PERFORMANCE METRICS
-# -------------------------------
+# ============================================================================
 def calculate_metrics(
     df: pd.DataFrame,
     price_lookup: Optional[Callable[[str], Optional[float]]] = None,
     start_equity: float = 10000.0,
-    risk_free_rate: float = RISK_FREE_RATE,
 ) -> Dict[str, Any]:
     """
-    Enhanced metrics calculator with robust error handling.
+    Calculate comprehensive trading performance metrics.
     
-    PATCHED: Fixed all critical issues:
-    - CAGR now handles negative equity correctly
-    - Proper realized trade detection
-    - Implemented Sortino ratio
-    - Capped profit factor at 9999
-    - Better handling of edge cases
+    Metrics included:
+    - Closed P/L, Win Rate, Profit Factor
+    - Sharpe Ratio (daily or intraday, annualized)
+    - Sortino Ratio (downside deviation only)
+    - CAGR (Compound Annual Growth Rate)
+    - Volatility (annualized)
+    - Max Drawdown (absolute and percentage)
+    - Trade statistics
+    - Open P/L (if price_lookup provided)
     
     Args:
-        df: Trade log DataFrame
-        price_lookup: Optional function to get current prices for open P/L
-        start_equity: Starting equity value
-        risk_free_rate: Annual risk-free rate for Sharpe/Sortino
-        
+        df: Trade history DataFrame
+        price_lookup: Optional function to get current prices for open positions
+        start_equity: Starting account equity
+    
     Returns:
-        Dictionary of performance metrics
+        Dictionary of metrics
     """
     if df is None or df.empty:
         out = default_metrics()
@@ -363,21 +393,13 @@ def calculate_metrics(
             "max_equity": float(start_equity),
             "min_equity": float(start_equity),
             "equity_end": float(start_equity),
+            "metrics_warning": "",
         })
         return out
 
     df = df.copy()
 
-    # Validate required columns
-    required_cols = ['timestamp', 'pnl']
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        logger.warning(f"DataFrame missing required columns: {missing}")
-        # Add missing columns with defaults
-        for col in missing:
-            df[col] = 0.0 if col == 'pnl' else pd.NaT
-
-    # Normalize expected columns
+    # Normalize columns
     if "pnl" not in df.columns:
         df["pnl"] = 0.0
     if "timestamp" not in df.columns:
@@ -385,24 +407,14 @@ def calculate_metrics(
 
     df["pnl_clean"] = pd.to_numeric(df["pnl"], errors="coerce")
 
-    # === Determine REALIZED trades ===
-    # FIXED: Better detection of realized trades
+    # ========================================================================
+    # IDENTIFY REALIZED TRADES (prefer SELL + filled)
+    # ========================================================================
     if {"action", "status"}.issubset(df.columns):
         a = df["action"].astype(str).str.upper()
         s = df["status"].astype(str).str.lower()
-        
-        # A trade is realized when:
-        # 1. It's a SELL (closing long) or BUY (closing short)
-        # 2. Status is Filled
-        # 3. Has non-null P&L
-        mask_sell = a.eq("SELL") & s.eq("filled") & df["pnl_clean"].notna()
-        
-        # For strategies that track shorts, BUY can also realize P&L
-        mask_buy = a.eq("BUY") & s.eq("filled") & df["pnl_clean"].notna()
-        
-        # Combine both
-        mask = mask_sell | mask_buy
-        
+        # mask = a.eq("SELL") & s.eq("filled") & df["pnl_clean"].notna()
+        mask = s.eq("filled") & df["pnl_clean"].notna()
         realized_df = df[mask].copy()
         
         if realized_df.empty:
@@ -413,9 +425,9 @@ def calculate_metrics(
 
     realized = realized_df["pnl_clean"]
 
-    # If still nothing, treat as flat equity at start_equity
+    # If no realized trades, return defaults
     if realized.empty:
-        base = _calculate_base_metrics(df, realized, None, price_lookup, risk_free_rate)
+        base = _calculate_base_metrics(df, realized, None, price_lookup, start_equity)
         base.update({
             "cagr": 0.0,
             "volatility": 0.0,
@@ -424,121 +436,126 @@ def calculate_metrics(
             "max_equity": float(start_equity),
             "min_equity": float(start_equity),
             "equity_end": float(start_equity),
+            "metrics_warning": "",
         })
         return base
 
-    # === Build Equity Series with proper timestamps ===
-    realized_ts = pd.to_datetime(realized_df["timestamp"], errors="coerce", utc=True)
+    # ========================================================================
+    # BUILD EQUITY SERIES
+    # ========================================================================
+    realized_ts = pd.to_datetime(realized_df["timestamp"], errors="coerce")
     equity_df = pd.DataFrame(
         {"equity": realized.cumsum() + float(start_equity)},
         index=realized_ts,
     )
     equity_df = equity_df.dropna().sort_index()
 
-    if equity_df.empty:
-        # No usable timestamps → treat as single point
-        equity_series = pd.Series(
-            [float(start_equity)],
-            index=pd.Index([pd.Timestamp.utcnow()]),
-            name="equity",
-        )
-    else:
-        equity_series = equity_df["equity"]
+    if equity_df.empty or len(equity_df) == 0:
+        # No valid timestamps -> return defaults
+        base = _calculate_base_metrics(df, realized, None, price_lookup, start_equity)
+        base.update({
+            "cagr": 0.0,
+            "volatility": 0.0,
+            "sharpe_daily": 0.0,
+            "sortino": 0.0,
+            "max_equity": float(start_equity),
+            "min_equity": float(start_equity),
+            "equity_end": float(start_equity),
+            "metrics_warning": "",
+        })
+        return base
 
-    # === Daily Returns ===
+    equity_series = equity_df["equity"]
+
+    # ========================================================================
+    # ENHANCED SHARPE/SORTINO WITH AUTO FREQUENCY DETECTION
+    # ========================================================================
+    sharpe_daily, sortino, freq_used = calculate_sharpe_sortino(equity_series)
+    
+    # Generate warning message if using intraday
+    if freq_used == "intraday":
+        daily_count = len(equity_series.resample("1D").last().dropna())
+        metrics_warning = (
+            f"⚠️ Using intraday Sharpe/Sortino (only {daily_count} trading days). "
+            f"Collect {MIN_DAILY_RETURNS_FOR_SHARPE}+ days for accurate daily metrics."
+        )
+    elif freq_used == "insufficient_data":
+        metrics_warning = "⚠️ Insufficient data for Sharpe/Sortino calculation."
+    else:
+        metrics_warning = ""
+
+    # ========================================================================
+    # DAILY RETURNS FOR VOLATILITY
+    # ========================================================================
     daily_equity = equity_series.resample("1D").last().dropna()
     daily_returns = daily_equity.pct_change().dropna()
-
-    # === Annualized Volatility ===
+    
     if len(daily_returns) > 1:
         volatility = float(daily_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR))
     else:
-        volatility = 0.0
+        # Fall back to trade-level volatility
+        trade_returns = equity_series.pct_change().dropna()
+        if len(trade_returns) > 1:
+            time_span_minutes = (equity_series.index[-1] - equity_series.index[0]).total_seconds() / 60
+            trades_per_minute = len(trade_returns) / max(time_span_minutes, 1)
+            trades_per_year = trades_per_minute * TRADING_MINUTES_PER_YEAR
+            volatility = float(trade_returns.std() * np.sqrt(max(trades_per_year, 1)))
+        else:
+            volatility = 0.0
 
-    # === CAGR (FIXED for negative equity) ===
+    # ========================================================================
+    # CAGR (Compound Annual Growth Rate)
+    # ========================================================================
     if len(daily_equity) > 1:
         start_val = float(daily_equity.iloc[0])
         end_val = float(daily_equity.iloc[-1])
         days = (daily_equity.index[-1] - daily_equity.index[0]).days
-        years = max(days / 365.25, 1e-9)
+        years = max(days / 365.25, 1/365.25)  # At least 1 day
         
-        # Handle negative equity cases
-        if start_val <= 0:
-            logger.warning("Starting equity is zero or negative, CAGR undefined")
-            cagr = 0.0
-        elif end_val <= 0:
-            logger.warning("Ending equity is zero or negative, total loss")
-            cagr = -1.0  # -100% return
+        if start_val > 0:
+            cagr = float((end_val / start_val) ** (1.0 / years) - 1.0)
         else:
-            try:
-                cagr = float((end_val / start_val) ** (1.0 / years) - 1.0)
-                # Cap at reasonable values
-                cagr = min(max(cagr, -0.99), 10.0)  # Between -99% and +1000%
-            except Exception as e:
-                logger.error(f"CAGR calculation error: {e}")
-                cagr = 0.0
+            cagr = 0.0
     else:
         cagr = 0.0
 
-    # === Sharpe (daily) ===
-    if len(daily_returns) > 1:
-        daily_rf = risk_free_rate / TRADING_DAYS_PER_YEAR
-        excess_returns = daily_returns - daily_rf
-        sharpe_daily = float(
-            excess_returns.mean() / (daily_returns.std() + 1e-9) * np.sqrt(TRADING_DAYS_PER_YEAR)
-        )
-        # Cap at reasonable values
-        sharpe_daily = min(max(sharpe_daily, -10.0), 10.0)
-    else:
-        sharpe_daily = 0.0
+    # ========================================================================
+    # CALCULATE BASE METRICS
+    # ========================================================================
+    base = _calculate_base_metrics(df, realized, equity_series, price_lookup, start_equity)
 
-    # === Sortino (IMPLEMENTED) ===
-    if len(daily_returns) > 1:
-        sortino = calculate_sortino(daily_returns, risk_free_rate)
-    else:
-        sortino = 0.0
-
-    # === Base metrics (win rate, PF, MDD on equity, etc.) ===
-    base = _calculate_base_metrics(
-        df, realized, equity_series, price_lookup, risk_free_rate
-    )
-
-    # === Add advanced fields ===
+    # ========================================================================
+    # ADD ADVANCED METRICS
+    # ========================================================================
     base.update({
-        "cagr": float(cagr),
-        "volatility": float(volatility),
-        "sharpe_daily": float(sharpe_daily),
-        "sortino": float(sortino),
+        "cagr": cagr,
+        "volatility": volatility,
+        "sharpe_daily": sharpe_daily,
+        "sortino": sortino,
         "max_equity": float(equity_series.max()),
         "min_equity": float(equity_series.min()),
         "equity_end": float(equity_series.iloc[-1]),
+        "metrics_warning": metrics_warning,
+        "metrics_frequency": freq_used,  # "daily", "intraday", or "insufficient_data"
     })
 
     return base
 
 
-# -------------------------------
-# Existing base metrics extractor
-# -------------------------------
+# ============================================================================
+# BASE METRICS CALCULATOR
+# ============================================================================
 def _calculate_base_metrics(
     df: pd.DataFrame,
     realized: pd.Series,
     equity_series: Optional[pd.Series],
     price_lookup: Optional[Callable[[str], Optional[float]]],
-    risk_free_rate: float,
+    start_equity: float,
 ) -> Dict[str, Any]:
     """
-    Internal: extracts the base metrics, plus MDD over equity_series.
+    Calculate base trading metrics (win rate, profit factor, drawdown, etc).
     
-    Args:
-        df: Full trade DataFrame
-        realized: Series of realized P&L
-        equity_series: Equity curve series
-        price_lookup: Function to get current prices
-        risk_free_rate: Risk-free rate for calculations
-        
-    Returns:
-        Dictionary of base metrics
+    Internal function called by calculate_metrics().
     """
     realized = realized.dropna()
     wins = realized[realized > 0]
@@ -546,7 +563,9 @@ def _calculate_base_metrics(
     realized_nz = realized[realized != 0]
     trade_count = int(len(realized_nz))
 
-    # --- Max Drawdown on equity if available, else on PnL ---
+    # ========================================================================
+    # MAX DRAWDOWN (on equity if available)
+    # ========================================================================
     if equity_series is not None and not equity_series.empty:
         pnl_for_mdd = equity_series.diff().fillna(0.0)
         ts_for_mdd = equity_series.index.to_series()
@@ -564,31 +583,41 @@ def _calculate_base_metrics(
             start_equity=0.0,
         )
 
+    # ========================================================================
+    # WIN/LOSS STATISTICS
+    # ========================================================================
     win_count = int(len(wins))
     loss_count = int(len(losses))
     avg_win = float(wins.mean()) if win_count else 0.0
     avg_loss = float(losses.mean()) if loss_count else 0.0
 
+    # ========================================================================
+    # AVERAGE TRADE DURATION
+    # ========================================================================
     avg_duration = 0.0
     if "duration" in df.columns:
         dur = pd.to_numeric(df["duration"], errors="coerce").dropna()
         avg_duration = float(dur.mean()) if not dur.empty else 0.0
 
-    # --- Profit Factor (FIXED: cap at 9999 instead of infinity) ---
+    # ========================================================================
+    # PROFIT FACTOR (robust)
+    # ========================================================================
     total_win = float(wins.sum())
     total_loss = float(abs(losses.sum()))
     
     if total_loss > 0.0:
         profit_factor = total_win / total_loss
     else:
-        profit_factor = 9999.0 if total_win > 0.0 else 0.0
+        profit_factor = float("inf") if total_win > 0.0 else 0.0
     
-    # Cap profit factor for display
-    profit_factor = min(profit_factor, 9999.0)
+    # Limit to reasonable display range
+    if np.isinf(profit_factor):
+        profit_factor = 999.99
 
+    # ========================================================================
+    # ASSEMBLE RESULTS
+    # ========================================================================
     result = {
-        "sharpe": 0.0,  # legacy, deprecated
-        "sortino": 0.0,  # Will be filled in by calculate_metrics
         "wins": win_count,
         "losses": loss_count,
         "win_rate": float((win_count / max(1, trade_count)) * 100.0),
@@ -598,36 +627,34 @@ def _calculate_base_metrics(
         "profit_factor": float(profit_factor),
         "max_drawdown": float(mdd_abs),
         "max_drawdown_pct": float(mdd_pct * 100.0),
-        "max_dd_start": str(dd_start) if dd_start is not None else "",
-        "max_dd_end": str(dd_end) if dd_end is not None else "",
+        "max_dd_start": dd_start if dd_start is not None else "",
+        "max_dd_end": dd_end if dd_end is not None else "",
         "max_dd_duration": float(dd_dur.total_seconds()),
         "avg_trade_duration": avg_duration,
         "total_pnl": float(realized.sum()),
         "number_of_trades": int(trade_count),
     }
 
-    # Open P/L
+    # ========================================================================
+    # OPEN P/L (if price lookup provided)
+    # ========================================================================
     if price_lookup is not None:
-        try:
-            open_pl_total, open_rows = compute_open_pl(df, price_lookup)
-            result["open_pl"] = float(open_pl_total)
-            result["open_pl_details"] = open_rows
-        except Exception as e:
-            logger.error(f"Error calculating open P/L: {e}", exc_info=True)
-            result["open_pl"] = 0.0
-            result["open_pl_details"] = []
+        open_pl_total, open_rows = compute_open_pl(df, price_lookup)
+        result["open_pl"] = float(open_pl_total)
+        result["open_pl_details"] = open_rows
+    else:
+        result["open_pl"] = 0.0
+        result["open_pl_details"] = []
 
     return result
 
 
-# -------------------------------
-# Default metrics
-# -------------------------------
+# ============================================================================
+# DEFAULT METRICS (for empty data)
+# ============================================================================
 def default_metrics(n: int = 0) -> Dict[str, Any]:
-    """Return default metrics structure with zeros."""
+    """Return default metrics structure with zero values."""
     return {
-        "sharpe": 0.0,
-        "sortino": 0.0,
         "wins": 0,
         "losses": 0,
         "win_rate": 0.0,
@@ -648,7 +675,10 @@ def default_metrics(n: int = 0) -> Dict[str, Any]:
         "cagr": 0.0,
         "volatility": 0.0,
         "sharpe_daily": 0.0,
+        "sortino": 0.0,
         "max_equity": 0.0,
         "min_equity": 0.0,
         "equity_end": 0.0,
+        "metrics_warning": "",
+        "metrics_frequency": "",
     }
